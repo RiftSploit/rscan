@@ -1,0 +1,122 @@
+name: Build Multi Target
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            build_tool: cargo
+            artifact_name: rscan-macos-arm64
+            binary_name: rscan
+
+          - name: Windows x64
+            runner: ubuntu-latest
+            target: x86_64-pc-windows-msvc
+            build_tool: xwin
+            artifact_name: rscan-windows-x64
+            binary_name: rscan.exe
+
+          - name: Windows arm64
+            runner: ubuntu-latest
+            target: aarch64-pc-windows-msvc
+            build_tool: xwin
+            artifact_name: rscan-windows-arm64
+            binary_name: rscan.exe
+
+          - name: Linux x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build_tool: cargo
+            artifact_name: rscan-linux-x64
+            binary_name: rscan
+
+          - name: Linux arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build_tool: zigbuild
+            artifact_name: rscan-linux-arm64
+            binary_name: rscan
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-xwin
+        if: matrix.build_tool == 'xwin'
+        run: cargo install cargo-xwin --locked
+
+      - name: Install Zig
+        if: matrix.build_tool == 'zigbuild'
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.build_tool == 'zigbuild'
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build (cargo)
+        if: matrix.build_tool == 'cargo'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (xwin)
+        if: matrix.build_tool == 'xwin'
+        run: cargo xwin build --release --target ${{ matrix.target }}
+
+      - name: Build (zigbuild)
+        if: matrix.build_tool == 'zigbuild'
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: mv target/${{ matrix.target }}/release/${{ matrix.binary_name }} target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3.2.2
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3.1.0
+        with:
+          path: artifacts
+
+      - name: Create release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/rscan-macos-arm64/rscan-macos-arm64
+            artifacts/rscan-windows-x64/rscan-windows-x64.exe
+            artifacts/rscan-windows-arm64/rscan-windows-arm64.exe
+            artifacts/rscan-linux-x64/rscan-linux-x64
+            artifacts/rscan-linux-arm64/rscan-linux-arm64
