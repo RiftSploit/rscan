@@ -1,4 +1,0 @@
-error: failed to parse manifest at `/Users/Kevin/Desktop/AI/git/rscan/Cargo.toml`
-
-Caused by:
-  can't find `scan_benchmark` bench at `benches/scan_benchmark.rs` or `benches/scan_benchmark/main.rs`. Please specify bench.path if you want to use a non-default path.
