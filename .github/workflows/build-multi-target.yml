@@ -66,6 +66,11 @@ jobs:
         with:
           version: 0.13.0
 
+      - name: Install build tools (for bundled sqlite)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
       - name: Install cargo-zigbuild
         if: matrix.build_tool == 'zigbuild'
         run: cargo install cargo-zigbuild --locked
@@ -77,6 +82,9 @@ jobs:
       - name: Build (xwin)
         if: matrix.build_tool == 'xwin'
         run: cargo xwin build --release --target ${{ matrix.target }}
+        env:
+          # ✅ 关键步骤：启用 bundled-windows 特性
+          SQLITE3_SRC_BUNDLED: 1
 
       - name: Build (zigbuild)
         if: matrix.build_tool == 'zigbuild'
