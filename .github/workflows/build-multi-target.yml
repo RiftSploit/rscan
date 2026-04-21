@@ -92,9 +92,17 @@ jobs:
         run: cargo zigbuild --release --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: mv target/${{ matrix.target }}/release/${{ matrix.binary_name }} target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        run: |
+          # 定义目标文件名
+          DEST_NAME="${{ matrix.artifact_name }}"
+          # 如果是 Windows，强制加上 .exe
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            DEST_NAME="${DEST_NAME}.exe"
+          fi
+          # 执行移动和重命名
+          mv target/${{ matrix.target }}/release/${{ matrix.binary_name }} target/${{ matrix.target }}/release/${DEST_NAME}
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
