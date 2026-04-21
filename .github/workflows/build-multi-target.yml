@@ -66,10 +66,11 @@ jobs:
         with:
           version: 0.13.0
 
-      - name: Install build tools (for bundled sqlite)
+      - name: Install build tools (for linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          sudo apt-get install -y build-essential llvm libsqlite3-dev
 
       - name: Install cargo-zigbuild
         if: matrix.build_tool == 'zigbuild'
