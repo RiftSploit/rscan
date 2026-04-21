@@ -4,8 +4,7 @@ use rscan::ip_ext::resolve_ips;
 use structopt::StructOpt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use rscan::port_db::ExcellentPort;
-use rscan::port_db::parse_ports_v2;
+use rscan::port_db::{parse_ports_v2, MERGED_PORTS};
 use std::sync::Arc;
 use rscan::parse_opt::{self, show_banner};
 use rscan::scanner::{
@@ -79,7 +78,7 @@ async fn main() -> io::Result<()> {
     let i = if opt.input.clone().is_some() { input_ip(opt.input) } else { input_file(opt.list).await };
     let i = resolve_ips(i).await;
     let assets = i.clone();
-    let o = if opt.port.is_some() { parse_ports_v2(opt.port) } else { ExcellentPort::new().merge() };
+    let o = if opt.port.is_some() { parse_ports_v2(opt.port) } else { MERGED_PORTS.clone() };
 
     let sockets: Vec<SocketAddr> = i
         .into_iter()

@@ -40,6 +40,7 @@ impl ProtocolInfo {
 }
 
 /// 探针特征
+#[derive(Clone, Copy)]
 pub struct ProbeContext {
     pub socket: SocketAddr,
     pub timeout: Duration,

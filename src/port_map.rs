@@ -186,10 +186,10 @@ impl PortRange {
     pub fn default_probes(&self) -> Vec<&'static str> {
         match self {
             PortRange::WellKnown => vec![
-                "http", "tls", "ssh", "ftp", "smtp", "smb", "generic-banner",
+                "http", "tls", "dns", "ssh", "ftp", "smtp", "smb", "generic-banner",
             ],
             PortRange::Registered => vec![
-                "http", "tls", "mysql", "postgresql", "redis", "memcached",
+                "http", "tls", "ftp", "mysql", "postgresql", "redis", "memcached",
                 "mongodb", "elasticsearch", "mqtt", "rabbitmq-amqp", 
                 "influxdb", "zookeeper", "generic-banner",
             ],
@@ -203,11 +203,11 @@ impl PortRange {
 /// 特殊服务密集区
 pub fn get_special_range_probes(port: u16) -> Option<Vec<&'static str>> {
     match port {
+        1389 => Some(vec!["ldap", "tls", "generic-banner"]),
         8000..=8999 => Some(vec!["http", "tls", "ajp"]),
         9000..=9999 => Some(vec!["http", "elasticsearch", "kibana", "prometheus"]),
         10000..=10999 => Some(vec!["http", "webmin", "usermin"]),
         16000..=16999 => Some(vec!["http", "tls", "generic-banner"]),  // IoT 通用探测
-        18000..=18999 => Some(vec!["mqtt", "tls", "http", "generic-banner"]),
         20000..=20999 => Some(vec!["http", "generic-banner"]),
         27000..=27999 => Some(vec!["mongodb", "http"]),
         _ => None,
@@ -237,6 +237,17 @@ mod tests {
     fn test_special_ranges() {
         assert!(get_special_range_probes(8080).is_some());
         assert!(get_special_range_probes(9200).is_some());
+        let ldap_alt = get_special_range_probes(1389).unwrap_or_default();
+        assert!(ldap_alt.contains(&"ldap"));
+        assert!(get_special_range_probes(3389).is_none());
+        assert!(get_special_range_probes(2000).is_none());
+        assert!(get_special_range_probes(18000).is_none());
         assert!(get_special_range_probes(12345).is_none());
+    }
+
+    #[test]
+    fn test_wellknown_range_includes_dns_probe() {
+        let probes = PortRange::WellKnown.default_probes();
+        assert!(probes.contains(&"dns"), "well-known range should include dns for broad <=10k probing");
     }
 }

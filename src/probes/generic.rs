@@ -118,15 +118,31 @@ pub async fn detect_rmi(ctx: &ProbeContext) -> Option<ProtocolInfo> {
         return None;
     }
 
-    let response = match read_banner_with_timeout(&mut stream, 256, ctx.timeout).await {
+    let response = match read_bytes_with_timeout(&mut stream, 256, ctx.timeout).await {
         Some(r) => r,
         None => return None,
     };
 
-    if response.contains("JRMI") || response.contains("RMI") {
+    if response.starts_with(b"JRMI") {
         return Some(
             ProtocolInfo::new("rmi", 0.9)
                 .with_details("Detected from JRMI handshake"),
+        );
+    }
+
+    // 部分 RMI 端点返回二进制传输层响应，不含可读 JRMI/RMI 文本
+    if matches!(response.first(), Some(0x4e | 0x4f | 0x51)) {
+        return Some(
+            ProtocolInfo::new("rmi", 0.75)
+                .with_details("Detected from binary RMI transport response"),
+        );
+    }
+
+    let text = String::from_utf8_lossy(&response);
+    if text.contains("JRMI") || text.contains("RMI") {
+        return Some(
+            ProtocolInfo::new("rmi", 0.8)
+                .with_details("Detected from RMI text signature"),
         );
     }
 
@@ -159,6 +175,109 @@ pub async fn detect_idap(ctx: &ProbeContext) -> Option<ProtocolInfo> {
     }
 
     None
+}
+
+/// DNS(TCP) 探测
+pub async fn detect_dns(ctx: &ProbeContext) -> Option<ProtocolInfo> {
+    let mut stream = match ctx.connect_with_timeout().await {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    // TCP DNS 查询（前置 2 字节长度）
+    const DNS_QUERY_TCP: &[u8] = &[
+        0x00, 0x1d, // length
+        0x12, 0x34, // id
+        0x01, 0x00, // flags: standard query
+        0x00, 0x01, // qdcount
+        0x00, 0x00, // ancount
+        0x00, 0x00, // nscount
+        0x00, 0x00, // arcount
+        0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
+        0x03, b'c', b'o', b'm',
+        0x00,       // root
+        0x00, 0x01, // type A
+        0x00, 0x01, // class IN
+    ];
+
+    if stream.write_all(DNS_QUERY_TCP).await.is_err() {
+        return None;
+    }
+
+    let response = read_bytes_with_timeout(&mut stream, 512, ctx.timeout).await?;
+    if response.len() < 14 {
+        return None;
+    }
+
+    let payload = &response[2..];
+    let flags = u16::from_be_bytes([payload[2], payload[3]]);
+    if flags & 0x8000 == 0 {
+        return None;
+    }
+
+    Some(
+        ProtocolInfo::new("dns", 0.9)
+            .with_details("Detected from DNS-over-TCP response"),
+    )
+}
+
+/// LDAP 探测（基于简单 BindRequest/BindResponse）
+pub async fn detect_ldap(ctx: &ProbeContext) -> Option<ProtocolInfo> {
+    let mut stream = match ctx.connect_with_timeout().await {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    const LDAP_BIND_REQUEST: &[u8] = &[
+        0x30, 0x0c, // LDAPMessage SEQUENCE
+        0x02, 0x01, 0x01, // messageID = 1
+        0x60, 0x07, // BindRequest [APPLICATION 0]
+        0x02, 0x01, 0x03, // version = 3
+        0x04, 0x00, // name = ""
+        0x80, 0x00, // simple auth = ""
+    ];
+
+    if stream.write_all(LDAP_BIND_REQUEST).await.is_err() {
+        return None;
+    }
+
+    let response = read_bytes_with_timeout(&mut stream, 512, ctx.timeout).await?;
+    if response.len() < 6 || response[0] != 0x30 {
+        return None;
+    }
+
+    if response.iter().any(|b| *b == 0x61) {
+        return Some(
+            ProtocolInfo::new("ldap", 0.9)
+                .with_details("Detected from LDAP BindResponse"),
+        );
+    }
+
+    None
+}
+
+/// FTP data 通道弱探测（适用于被动模式数据端口）
+pub async fn detect_ftp_data(ctx: &ProbeContext) -> Option<ProtocolInfo> {
+    let mut stream = match ctx.connect_with_timeout().await {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let mut buf = [0u8; 8];
+    let read_result = timeout(Duration::from_millis(200), stream.read(&mut buf)).await;
+    match read_result {
+        // FTP 数据通道常见行为：连接建立后短时间无banner
+        Err(_) => Some(
+            ProtocolInfo::new("ftp-data", 0.55)
+                .with_details("Heuristic: passive FTP data channel behavior"),
+        ),
+        Ok(Ok(0)) => None,
+        Ok(Ok(_)) => Some(
+            ProtocolInfo::new("ftp-data", 0.6)
+                .with_details("Heuristic: FTP data channel with payload"),
+        ),
+        Ok(Err(_)) => None,
+    }
 }
 
 /// 通用探测入口

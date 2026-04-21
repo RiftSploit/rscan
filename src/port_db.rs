@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use once_cell::sync::Lazy;
+
 /// 此处存储了一些端口的分类，便于管理
 /// global_distribute 端口全球发布, 来源于Quake空间测绘统计
 /// http_protocol http协议端口号
@@ -17,6 +19,8 @@ pub struct ExcellentPort {
     unauthentication_ports: Vec<u16>,
     top1000_list: Vec<u16>,
 }
+
+pub static EXCELLENT_PORT: Lazy<ExcellentPort> = Lazy::new(ExcellentPort::new);
 
 impl ExcellentPort {
     pub fn new() -> Self {
@@ -43,10 +47,14 @@ impl ExcellentPort {
         set.extend(&self.unauthentication_ports);
         set.extend(&self.top1000_list);
 
-        // 将 HashSet 转换回 Vec
-        set.into_iter().collect()
+        // 将 HashSet 转换回 Vec，然后排序
+        let mut result: Vec<u16> = set.into_iter().collect();
+        result.sort_unstable();
+        result
     }
 }
+
+pub static MERGED_PORTS: Lazy<Vec<u16>> = Lazy::new(|| EXCELLENT_PORT.merge());
 #[allow(dead_code)]
 pub fn parse_ports(port_input: &str) -> Vec<u16> {
     let mut ports = Vec::new();

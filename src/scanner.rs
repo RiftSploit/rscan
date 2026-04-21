@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,7 @@ use std::time::Instant;
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
+use rusqlite::{Connection, params};
 
 pub const RESUME_STATE_FILE: &str = "rscan.resume.json";
 
@@ -86,6 +87,164 @@ struct ProgressState {
 struct PersistState {
     pending_changes: usize,
     last_persist_at: Instant,
+    persist_count: u32,
+    last_persist_time: Instant,
+}
+
+#[derive(Debug)]
+struct DebugLogState {
+    write_count: usize,
+    last_flush_at: Instant,
+}
+
+impl DebugLogState {
+    fn new() -> Self {
+        Self {
+            write_count: 0,
+            last_flush_at: Instant::now(),
+        }
+    }
+
+    fn should_flush(&self) -> bool {
+        self.write_count >= 100 || self.last_flush_at.elapsed() >= Duration::from_secs(1)
+    }
+
+    fn reset(&mut self) {
+        self.write_count = 0;
+        self.last_flush_at = Instant::now();
+    }
+}
+
+#[derive(Debug)]
+struct PagingManager {
+    db_path: Option<PathBuf>,
+    buffer: Vec<ScanRecord>,
+    buffer_size: usize,
+}
+
+impl PagingManager {
+    fn new(buffer_size: usize) -> Self {
+        Self {
+            db_path: None,
+            buffer: Vec::with_capacity(buffer_size),
+            buffer_size,
+        }
+    }
+
+    fn init_db(&mut self) -> io::Result<()> {
+        let tmpdir = std::env::temp_dir();
+        let db_path = tmpdir.join(format!("rscan_scan_{}.db", uuid_string()));
+        
+        let conn = Connection::open(&db_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS scan_results (
+                id INTEGER PRIMARY KEY,
+                ip TEXT NOT NULL,
+                port INTEGER,
+                protocol TEXT NOT NULL,
+                data TEXT
+            )",
+            [],
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        
+        self.db_path = Some(db_path);
+        Ok(())
+    }
+
+    fn add_record(&mut self, record: ScanRecord) -> io::Result<()> {
+        self.buffer.push(record);
+        if self.buffer.len() >= self.buffer_size {
+            self.flush_to_db()?;
+        }
+        Ok(())
+    }
+
+    fn flush_to_db(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let db_path = match &self.db_path {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        };
+
+        let mut conn = Connection::open(&db_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let tx = conn.transaction()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        for record in self.buffer.drain(..) {
+            tx.execute(
+                "INSERT INTO scan_results (ip, protocol, data) VALUES (?1, ?2, ?3)",
+                params![
+                    &record.target,
+                    &record.protocol,
+                    serde_json::to_string(&record).unwrap_or_default(),
+                ],
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        tx.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        Ok(())
+    }
+
+    fn retrieve_all(&mut self) -> io::Result<Vec<ScanRecord>> {
+        let mut records = Vec::new();
+
+        for record in self.buffer.drain(..) {
+            records.push(record);
+        }
+
+        if let Some(db_path) = &self.db_path {
+            let conn = Connection::open(db_path)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            let mut stmt = conn.prepare("SELECT data FROM scan_results")
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            let record_iter = stmt.query_map([], |row| {
+                let json_str: String = row.get(0)?;
+                Ok(serde_json::from_str(&json_str).unwrap_or_else(|_| ScanRecord {
+                    target: String::new(),
+                    time: String::new(),
+                    protocol: String::new(),
+                    version: None,
+                    details: None,
+                    confidence: 0.0,
+                }))
+            }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            for row_result in record_iter {
+                let record = row_result.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                records.push(record);
+            }
+        }
+
+        Ok(records)
+    }
+
+    fn cleanup(&self) -> io::Result<()> {
+        if let Some(db_path) = &self.db_path {
+            if db_path.exists() {
+                std::fs::remove_file(db_path)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn uuid_string() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}{:06}", duration.as_secs(), duration.subsec_micros())
 }
 
 pub struct Scanner {
@@ -97,10 +256,12 @@ pub struct Scanner {
     protocol_detector: ProtocolDetector,
     output_format: OutputFormat,
     output_path: Option<PathBuf>,
-    debug_output: Option<Mutex<File>>,
+    debug_output: Option<Mutex<BufWriter<File>>>,
+    debug_log_state: Mutex<DebugLogState>,
     resume_path: PathBuf,
     resume_state: Mutex<ResumeState>,
     persist: Mutex<PersistState>,
+    paging: Mutex<PagingManager>,
     target_index: HashMap<String, usize>,
     progress: Mutex<ProgressState>,
 }
@@ -176,7 +337,7 @@ pub fn pending_sockets(state: &ResumeState) -> Vec<SocketAddr> {
 impl Scanner {
     pub fn new(state: ResumeState, resume_path: PathBuf, is_resume_mode: bool) -> io::Result<Self> {
         let debug_output = match &state.config.debug_log_path {
-            Some(path) => Some(Mutex::new(File::create(path)?)),
+            Some(path) => Some(Mutex::new(BufWriter::new(File::create(path)?))),
             None => None,
         };
 
@@ -192,6 +353,9 @@ impl Scanner {
             .filter(|t| t.status == TargetStatus::Completed)
             .count();
 
+        let mut paging = PagingManager::new(10000);
+        paging.init_db()?;
+
         Ok(Self {
             batch_size: state.config.concurrency.max(1),
             initial_timeout: Duration::from_millis(state.config.initial_timeout_ms.max(50)),
@@ -205,12 +369,16 @@ impl Scanner {
             output_format: state.config.output_format,
             output_path: state.config.output_path.clone(),
             debug_output,
+            debug_log_state: Mutex::new(DebugLogState::new()),
             resume_path,
             resume_state: Mutex::new(state),
             persist: Mutex::new(PersistState {
                 pending_changes: 0,
                 last_persist_at: Instant::now(),
+                persist_count: 0,
+                last_persist_time: Instant::now(),
             }),
+            paging: Mutex::new(paging),
             target_index,
             progress: Mutex::new(ProgressState {
                 completed_targets: completed,
@@ -239,6 +407,7 @@ impl Scanner {
     pub async fn run(self: Arc<Self>, sockets: Vec<SocketAddr>) {
         if sockets.is_empty() {
             let _ = self.flush_output_from_state();
+            let _ = self.flush_debug_log();
             let _ = std::fs::remove_file(&self.resume_path);
             return;
         }
@@ -294,9 +463,17 @@ impl Scanner {
 
         self.maybe_persist_state(true);
 
+        if let Err(e) = self.finalize_and_flush_results() {
+            eprintln!("结果聚合失败: {:?}", e);
+            self.log_debug(&format!("result-aggregation-error err={:?}", e));
+            let _ = self.flush_debug_log();
+            return;
+        }
+
         if let Err(e) = self.flush_output_from_state() {
             eprintln!("输出写入失败: {:?}", e);
             self.log_debug(&format!("output-flush-error err={:?}", e));
+            let _ = self.flush_debug_log();
             return;
         }
 
@@ -305,6 +482,23 @@ impl Scanner {
         if let Err(e) = std::fs::remove_file(&self.resume_path) {
             self.log_debug(&format!("resume-cleanup-error err={:?}", e));
         }
+
+        let _ = self.flush_debug_log();
+    }
+
+    fn finalize_and_flush_results(&self) -> io::Result<()> {
+        let mut paging = self.paging.lock().unwrap();
+        
+        paging.flush_to_db()?;
+        
+        let mut all_records = paging.retrieve_all()?;
+        
+        let mut state = self.resume_state.lock().unwrap();
+        state.records.append(&mut all_records);
+        
+        paging.cleanup()?;
+        
+        Ok(())
     }
 
     fn enqueue_validation_tasks(
@@ -403,6 +597,7 @@ impl Scanner {
         if changed {
             self.tick_progress();
             self.note_state_change();
+            self.tick_persist_count();
             self.maybe_persist_state(false);
         }
     }
@@ -412,7 +607,14 @@ impl Scanner {
         if state.records.iter().any(|r| r.target == record.target) {
             return;
         }
-        state.records.push(record);
+        state.records.push(record.clone());
+        
+        if state.records.len() >= 10000 {
+            let mut paging = self.paging.lock().unwrap();
+            for r in state.records.drain(..) {
+                let _ = paging.add_record(r);
+            }
+        }
         drop(state);
         self.note_state_change();
         self.maybe_persist_state(false);
@@ -428,16 +630,20 @@ impl Scanner {
         p.pending_changes = p.pending_changes.saturating_add(1);
     }
 
+    fn tick_persist_count(&self) {
+        let mut p = self.persist.lock().unwrap();
+        p.persist_count = p.persist_count.saturating_add(1);
+    }
+
     fn maybe_persist_state(&self, force: bool) {
-        const PERSIST_INTERVAL: Duration = Duration::from_secs(1);
-        const PERSIST_CHANGE_THRESHOLD: usize = 256;
+        const PERSIST_BATCH_SIZE: u32 = 100;
+        const PERSIST_TIME_INTERVAL: Duration = Duration::from_secs(5);
 
         let should_persist = {
             let p = self.persist.lock().unwrap();
             force
-                || (p.pending_changes > 0
-                    && (p.pending_changes >= PERSIST_CHANGE_THRESHOLD
-                        || p.last_persist_at.elapsed() >= PERSIST_INTERVAL))
+                || (p.persist_count >= PERSIST_BATCH_SIZE
+                    || (p.persist_count > 0 && p.last_persist_time.elapsed() >= PERSIST_TIME_INTERVAL))
         };
 
         if !should_persist {
@@ -447,6 +653,8 @@ impl Scanner {
         match self.persist_state() {
             Ok(()) => {
                 let mut p = self.persist.lock().unwrap();
+                p.persist_count = 0;
+                p.last_persist_time = Instant::now();
                 p.pending_changes = 0;
                 p.last_persist_at = Instant::now();
             }
@@ -512,7 +720,23 @@ impl Scanner {
         if let Some(file) = &self.debug_output {
             let mut file = file.lock().unwrap();
             let _ = file.write_all(format!("{}\n", message).as_bytes());
+
+            let mut state = self.debug_log_state.lock().unwrap();
+            state.write_count += 1;
+
+            if state.should_flush() {
+                let _ = file.flush();
+                state.reset();
+            }
         }
+    }
+
+    fn flush_debug_log(&self) -> io::Result<()> {
+        if let Some(file) = &self.debug_output {
+            let mut file = file.lock().unwrap();
+            file.flush()?;
+        }
+        Ok(())
     }
 
     fn flush_output_from_state(&self) -> io::Result<()> {
